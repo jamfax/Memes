@@ -1,0 +1,14 @@
+<QueryList>
+  <Query Id="0" Path="Security">
+    <Select Path="Security">
+      *[
+        System[
+          Provider[@Name='Microsoft-Windows-Security-Auditing']
+          and (EventID=6272 or EventID=6273 or EventID=6278 or EventID=6279)
+        ]
+      ]
+      and
+      *[EventData[Data[@Name='NetworkPolicyName']='PolicyNameHere']]
+    </Select>
+  </Query>
+</QueryList>
