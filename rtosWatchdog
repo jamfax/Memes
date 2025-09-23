@@ -1,0 +1,95 @@
+#!/bin/zsh
+set -euo pipefail
+
+# Paths
+SCRIPT="/usr/local/bin/returnToService-watch.sh"
+PLIST="/Library/LaunchDaemons/au.loan.returntoservice.watch.plist"
+
+# Create dirs
+mkdir -p /usr/local/bin /Library/LaunchDaemons
+
+# Write watcher script
+cat > "$SCRIPT" <<'EOF'
+#!/bin/zsh
+set -euo pipefail
+EVENT="returnToService"
+
+# Skip during setup/OS install
+if pgrep -qx "Setup Assistant" || pgrep -qx "OSInstaller"; then exit 0; fi
+
+# Only run at login window (console root)
+consoleUser="$(stat -f%Su /dev/console || true)"
+[[ "$consoleUser" == "root" ]] || exit 0
+
+# Backoff 5 minutes
+STAMP="/var/tmp/rtos.last"
+now="$(date +%s)"
+if [[ -f "$STAMP" ]]; then
+  last="$(cat "$STAMP" 2>/dev/null || echo 0)"
+  (( now - last < 300 )) && exit 0
+fi
+
+# Trigger Jamf policy
+if /usr/local/bin/jamf policy -event "$EVENT"; then
+  echo "$now" > "$STAMP"
+fi
+EOF
+chmod 755 "$SCRIPT"
+
+# Write LaunchDaemon
+cat > "$PLIST" <<'EOF'
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+ <dict>
+  <key>Label</key><string>au.loan.returntoservice.watch</string>
+  <key>ProgramArguments</key>
+   <array>
+     <string>/usr/local/bin/returnToService-watch.sh</string>
+   </array>
+  <key>RunAtLoad</key><true/>
+  <key>StartInterval</key><integer>60</integer>
+  <key>StandardOutPath</key><string>/var/log/rtos-watch.log</string>
+  <key>StandardErrorPath</key><string>/var/log/rtos-watch.log</string>
+ </dict>
+</plist>
+EOF
+chown root:wheel "$PLIST"
+chmod 644 "$PLIST"
+
+/bin/launchctl bootout system/au.loan.returntoservice.watch 2>/dev/null || true
+/bin/launchctl bootstrap system "$PLIST"
+exit 0#!/bin/zsh
+set -euo pipefail
+
+# custom event name in Jamf policy
+EVENT="returnToService"
+
+# don't run if Setup Assistant or macOS updates are in flight
+if pgrep -qx "Setup Assistant" || pgrep -qx "OSInstaller"; then
+  exit 0
+fi
+
+# who is at the console?
+consoleUser=$(stat -f%Su /dev/console || true)
+
+# only run when no one is logged in (loginwindow state = root)
+if [[ "$consoleUser" != "root" ]]; then
+  exit 0
+fi
+
+# simple backoff so we don't hammer jamf at the loginwindow
+STAMP="/var/tmp/rtos.last"
+now=$(date +%s)
+if [[ -f "$STAMP" ]]; then
+  last=$(cat "$STAMP" 2>/dev/null || echo 0)
+  # skip if we ran in the last 5 minutes
+  if (( now - last < 300 )); then
+    exit 0
+  fi
+fi
+
+# trigger the Jamf policy
+if /usr/local/bin/jamf policy -event "$EVENT"; then
+  echo "$now" > "$STAMP"
+fi
