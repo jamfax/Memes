@@ -1,0 +1,20 @@
+#!/bin/zsh
+set -euo pipefail
+
+# keep these local accounts
+keep=("admin" "jamfadmin")
+
+# delete local users (ignore system accounts starting with _)
+for u in $(dscl . list /Users | grep -v '^_'); do
+  if [[ ! " ${keep[*]} " =~ " $u " ]]; then
+    echo "Deleting $u"
+    /usr/sbin/sysadminctl -deleteUser "$u" -secure 2>/dev/null || true
+    rm -rf "/Users/$u" 2>/dev/null || true
+  fi
+done
+
+# optional hygiene
+rm -rf /Users/Shared/* 2>/dev/null || true
+rm -rf /Library/Caches/* 2>/dev/null || true
+
+exit 0
