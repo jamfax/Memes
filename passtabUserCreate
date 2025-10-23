@@ -3,119 +3,178 @@
 #                Created by James Hallifax 23.10.2025               #
 #                           Catalytic IT                            #
 #                                                                   #
-#                        Version 1.0.0                              #
+#                        Version 1.0.1                              #
 #####################################################################
 
-param(
-  [Parameter(Mandatory=$true)] [string] $BaseUrl,  # e.g. https://sbcl.passtab.com/v1/public
+paramparam(
+  [Parameter(Mandatory=$true)] [string] $BaseUrl,      # e.g. https://sbcl.passtab.com/v1/public
   [Parameter(Mandatory=$true)] [string] $ApiKey,
   [Parameter(Mandatory=$true)] [string] $CsvPath,
+  [ValidateSet('CreateOnly','UpdateOnly','Upsert')] [string] $Mode = 'Upsert',
   [switch] $DryRun,
+  [string] $DefaultType,         # e.g. "Staff" to fill blank type cells
   [int] $ThrottleMs = 150,
-  [string] $LogPath = "$(Split-Path -Parent $CsvPath)\passtab_min_$(Get-Date -Format 'yyyyMMdd_HHmmss').csv"
+  [string] $LogPath              # if not supplied, we'll place it alongside the CSV
 )
 
-# ---------- helpers ----------
+# ---------- Path & logging guards ----------
+$CsvPath = (Resolve-Path -LiteralPath $CsvPath).Path
+if (-not $LogPath -or [string]::IsNullOrWhiteSpace($LogPath)) {
+  $csvDir = (Split-Path -Parent $CsvPath); if (-not $csvDir) { $csvDir = (Get-Location).Path }
+  $LogPath = Join-Path $csvDir ("passtab_upsert_{0}.csv" -f (Get-Date -Format 'yyyyMMdd_HHmmss'))
+}
+
+# ---------- Helpers ----------
 function Mask-Key([string]$k) {
   if ([string]::IsNullOrEmpty($k) -or $k.Length -lt 6) { return '***' }
   $k.Substring(0,3) + ('*' * ($k.Length-6)) + $k.Substring($k.Length-3)
 }
-
-function New-Headers([string]$k) {
-  @{
-    'PASSTAB-API-KEY' = $k
-  }
+function Test-BaseUrl { param([string]$BaseUrl)
+  $b = $BaseUrl.Trim()
+  if ($b -notmatch '^(https?)://') { throw "BaseUrl must start with http:// or https:// (got '$BaseUrl')" }
+  $b.TrimEnd('/')
 }
 
-function Invoke-PasstabApi {
+# Core HTTP invoker (solid URL building)
+function Invoke-Passtab {
   param(
-    [ValidateSet('GET','POST')] [string] $Method,
+    [ValidateSet('GET','POST','PUT')] [string] $Method,
     [string] $Path,
-    [hashtable] $Body
+    [hashtable] $Body = $null,
+    [hashtable] $Query = $null,
+    [switch] $Swallow404   # if set, returns $null on 404 instead of throwing
   )
+  $headers = @{ 'PASSTAB-API-KEY' = $ApiKey }
+  $base = Test-BaseUrl -BaseUrl $BaseUrl
+  if ([string]::IsNullOrWhiteSpace($Path)) { $Path = '' } elseif ($Path[0] -ne '/') { $Path = '/' + $Path }
 
-  $headers = New-Headers $ApiKey
-  $uri = ($BaseUrl.TrimEnd('/')) + $Path
-  $attempt = 0; $max = 5; $rand = [Random]::new()
-
-  while ($true) {
-    $attempt++
-    try {
-      if ($Method -eq 'GET') {
-        return Invoke-RestMethod -Method GET -Uri $uri -Headers $headers -TimeoutSec 60
-      } else {
-        return Invoke-RestMethod -Method POST -Uri $uri -Headers $headers -Body $Body -TimeoutSec 60
-      }
-    } catch {
-      $status = $null
-      if ($_.Exception.Response -and $_.Exception.Response.StatusCode) {
-        $status = [int]$_.Exception.Response.StatusCode
-      }
-      $transient = $status -in 408,429,500,502,503,504
-      if ($attempt -lt $max -and $transient) {
-        $delay = [Math]::Min(6000, [Math]::Pow(2,$attempt)*200 + $rand.Next(0,200))
-        Start-Sleep -Milliseconds $delay
-        continue
-      }
-      throw "API $Method $Path failed (attempt $attempt, status=$status): $($_.Exception.Message)"
+  $builder = [System.UriBuilder]::new("$base$Path")
+  if ($Query -and $Query.Count -gt 0) {
+    $pairs = foreach ($kv in $Query.GetEnumerator()) {
+      "{0}={1}" -f ([Uri]::EscapeDataString([string]$kv.Key)), ([Uri]::EscapeDataString([string]$kv.Value))
     }
+    $builder.Query = ($pairs -join '&')
+  }
+  $uri = $builder.Uri.AbsoluteUri
+
+  try {
+    switch ($Method) {
+      'GET' { return Invoke-RestMethod -Method GET  -Uri $uri -Headers $headers -TimeoutSec 60 }
+      'POST'{ return Invoke-RestMethod -Method POST -Uri $uri -Headers $headers -Body $Body -TimeoutSec 60 }
+      'PUT' { return Invoke-RestMethod -Method PUT  -Uri $uri -Headers $headers -Body $Body -TimeoutSec 60 }
+    }
+  } catch {
+    $status = $null
+    if ($_.Exception.Response -and $_.Exception.Response.StatusCode) { $status = [int]$_.Exception.Response.StatusCode }
+    if ($Swallow404 -and $status -eq 404) { return $null }  # <-- treat 404 as "not found"
+    $server = if ($_.ErrorDetails.Message) { $_.ErrorDetails.Message } else { $_.Exception.Message }
+
+    Write-Host "`n--- DEBUG request ---"
+    Write-Host "URL: $uri"
+    if ($Body) { $Body.GetEnumerator() | Sort-Object Name | ForEach-Object { "{0} = {1}" -f $_.Name, $_.Value } | Write-Host } else { Write-Host "(no body)" }
+    Write-Host "----------------------`n"
+
+    throw "API $Method $Path failed (status=$status): $server"
   }
 }
 
-function New-PasstabUser {
+# Accept either firstName/first_name, lastName/last_name, email/user_email, etc.
+function Normalize-Row {
+  param([object]$row)
+  $h = @{}
+  foreach ($p in $row.PSObject.Properties) {
+    $key = ('' + $p.Name).Trim()
+    $val = if ($null -eq $p.Value) { '' } else { ('' + $p.Value).Trim() }
+    $h[$key] = $val
+  }
+  if (-not $h.ContainsKey('firstName') -and $h.ContainsKey('first_name')) { $h['firstName'] = $h['first_name'] }
+  if (-not $h.ContainsKey('lastName')  -and $h.ContainsKey('last_name'))  { $h['lastName']  = $h['last_name']  }
+  if (-not $h.ContainsKey('email')     -and $h.ContainsKey('user_email')) { $h['email']     = $h['user_email'] }
+  return $h
+}
+
+function Test-RowLocal {
+  param([hashtable]$r, [string]$DefaultType)
+  $errs = New-Object System.Collections.Generic.List[string]
+  foreach ($k in 'quickpin','firstName','lastName') {
+    if (-not $r[$k] -or [string]::IsNullOrWhiteSpace($r[$k])) { $errs.Add("Missing '$k'.") }
+  }
+  if (-not $r['type'] -or [string]::IsNullOrWhiteSpace($r['type'])) {
+    if ($DefaultType) { $r['type'] = $DefaultType } else { $errs.Add("Missing 'type'.") }
+  }
+  if ($r['email'] -and ($r['email'] -notmatch '^[^@\s]+@[^@\s]+\.[^@\s]+$')) { $errs.Add("Invalid email '$($r['email'])'.") }
+  if ($r['quickpin'] -and ($r['quickpin'] -notmatch '^\d{1,}$')) { $errs.Add("quickpin should be numeric (got '$($r['quickpin'])').") }
+  ,$errs
+}
+
+# ---------- Create/Update payloads ----------
+function Build-CreateForm {
   param([hashtable]$r)
-
-  # Normalize type to title case
   $type = ('' + $r.type).Trim().ToLower()
-  switch ($type) {
-    'staff'   { $type = 'Staff' }
-    'student' { $type = 'Student' }
-    'visitor' { $type = 'Visitor' }
-    default   { $type = $r.type }
-  }
-
-  # Default visitor subtype
-  $visitorType = if ($r.ContainsKey('visitorType') -and $r.visitorType) {
-    ('' + $r.visitorType).Trim()
-  } elseif ($type -eq 'Visitor') {
-    'Visitor'
-  } else {
-    'Visitor'
-  }
-
-  # Build REQUIRED form fields (form-url-encoded) Use these headers to build your CSV
+  switch ($type) { 'staff'{$type='Staff'} 'student'{$type='Student'} 'visitor'{$type='Visitor'} default{$type=$r.type} }
+  $visitorType = if ($r.ContainsKey('visitorType') -and $r.visitorType) { ('' + $r.visitorType).Trim() }
+                 elseif ($type -eq 'Visitor') { 'Visitor' } else { 'Visitor' }
   $form = @{
     quickpin               = ('' + $r.quickpin).Trim()
     first_name             = ('' + $r.firstName).Trim()
     last_name              = ('' + $r.lastName).Trim()
     type                   = $type
     customize_visitor_form = $visitorType
-    user_email             = ('' + $r.email).Trim()   # <-- was 'email'; now 'user_email'
   }
-
-  Invoke-PasstabApi -Method POST -Path '/registered-users' -Body $form
+  if ($r.email) { $form.user_email = ('' + $r.email).Trim() }
+  $form
 }
 
-# ---------- main ----------
+# For updates, don't send 'type'
+function Build-UpdateForm {
+  param([hashtable]$r)
+  $form = @{}
+  if ($r.firstName) { $form.first_name = ('' + $r.firstName).Trim() }
+  if ($r.lastName)  { $form.last_name  = ('' + $r.lastName).Trim()  }
+  if ($r.email)     { $form.user_email = ('' + $r.email).Trim()     }
+  if ($r.quickpin)  { $form.quickpin   = ('' + $r.quickpin).Trim()  }
+  if ($r.visitorType){$form.customize_visitor_form = ('' + $r.visitorType).Trim() }
+  $form
+}
+
+# ---------- API wrappers ----------
+function TryFind-RegisteredUserId {
+  param([string]$quickpin, [string]$email)
+  if ($quickpin) {
+    $res = Invoke-Passtab -Method GET -Path '/registered-users' -Query @{ 'filter[quickpin]' = $quickpin; 'pagesize' = '1' } -Swallow404
+    if ($res -and $res.success.registered_users -and $res.success.registered_users.Count -gt 0) { return $res.success.registered_users[0].id }
+  }
+  if ($email) {
+    $res = Invoke-Passtab -Method GET -Path '/registered-users' -Query @{ 'filter[user_email]' = $email; 'pagesize' = '1' } -Swallow404
+    if ($res -and $res.success.registered_users -and $res.success.registered_users.Count -gt 0) { return $res.success.registered_users[0].id }
+  }
+  return $null
+}
+
+function Create-RegisteredUser { param([hashtable]$r) (Invoke-Passtab -Method POST -Path '/registered-users' -Body (Build-CreateForm $r)) }
+function Update-RegisteredUser { param([string]$Id, [hashtable]$r) (Invoke-Passtab -Method PUT  -Path "/registered-users/$Id" -Body (Build-UpdateForm $r)) }
+
+# ---------- Main ----------
 Write-Host "[Passtab] BaseUrl: $BaseUrl"
 Write-Host "[Passtab] API Key: $(Mask-Key $ApiKey)"
-Write-Host "[Passtab] CSV: $CsvPath  DryRun=$DryRun  Log: $LogPath"
+Write-Host "[Passtab] CSV: $CsvPath  Mode=$Mode  DryRun=$DryRun  Log: $LogPath  DefaultType=$DefaultType"
+
 if (-not (Test-Path -LiteralPath $CsvPath)) { throw "CSV not found: $CsvPath" }
 
 $rows = Import-Csv -LiteralPath $CsvPath
-$log = New-Object System.Collections.Generic.List[object]
+$log  = New-Object System.Collections.Generic.List[object]
 $rowNum = 0
 
 foreach ($row in $rows) {
   $rowNum++
-  $r = @{}
-  foreach ($p in $row.PSObject.Properties) { $r[$p.Name] = $p.Value }
+  $r = Normalize-Row $row
 
   $summary = [ordered]@{
     Row        = $rowNum
     QuickPin   = $r.quickpin
     Email      = $r.email
     Type       = $r.type
+    Action     = ''
     Status     = 'Pending'
     HttpStatus = ''
     ResultId   = ''
@@ -123,24 +182,87 @@ foreach ($row in $rows) {
   }
 
   try {
-    if ($DryRun) {
-      $summary.Status = 'OK-DRYRUN'
+    $localErrs = Test-RowLocal -r $r -DefaultType $DefaultType
+    if ($localErrs.Count) {
+      $summary.Status = 'LocalValidationFailed'
+      $summary.Error  = ($localErrs -join ' ')
       $log.Add([pscustomobject]$summary)
-      Write-Host "Row $rowNum [DRY-RUN] would create '$($r.email)' as $($r.type)."
+      Write-Warning "Row $rowNum failed local validation: $($summary.Error)"
       continue
     }
 
-    $resp = New-PasstabUser -r $r
+    # Find existing (404 -> not found)
+    $existingId = TryFind-RegisteredUserId -quickpin $r.quickpin -email $r.email
 
-    $id = $null
-    foreach ($n in 'id','userId','_id') { if ($resp.PSObject.Properties.Name -contains $n) { $id = $resp.$n; break } }
+    if ($Mode -eq 'CreateOnly' -and $existingId) {
+      $summary.Action = 'Skip-Exists'
+      $summary.Status = 'Skipped'
+      $summary.ResultId = "$existingId"
+      $log.Add([pscustomobject]$summary)
+      Write-Host "Row $rowNum skipped (CreateOnly): user exists (Id=$existingId)."
+      continue
+    }
+    if ($Mode -eq 'UpdateOnly' -and -not $existingId) {
+      $summary.Action = 'Skip-Missing'
+      $summary.Status = 'Skipped'
+      $log.Add([pscustomobject]$summary)
+      Write-Host "Row $rowNum skipped (UpdateOnly): user not found."
+      continue
+    }
 
-    $summary.Status     = 'Created'
-    $summary.HttpStatus = '200'
-    $summary.ResultId   = "$id"
+    if ($DryRun) {
+      $summary.Action = $existingId ? 'Would-Update' : 'Would-Create'
+      $summary.Status = 'OK-DRYRUN'
+      $summary.ResultId = "$existingId"
+      $log.Add([pscustomobject]$summary)
+      Write-Host "Row $rowNum [DRY-RUN] $($summary.Action): $($r.email ?? $r.quickpin)."
+      continue
+    }
+
+    if ($existingId) {
+      $resp = Update-RegisteredUser -Id $existingId -r $r
+      $summary.Action = 'Update'
+      $summary.Status = 'Updated'
+      $summary.HttpStatus = '200'
+      $summary.ResultId = "$existingId"
+      Write-Host "Row $rowNum updated (Id=$existingId)."
+    } else {
+      # Try create; if server says quickpin already in use, fall back to update
+      try {
+        $resp = Create-RegisteredUser -r $r
+        $newId = $null
+        if ($resp.success -and $resp.success.registered_user) {
+          foreach ($n in 'id','userId','_id'){ if ($resp.success.registered_user.PSObject.Properties.Name -contains $n){ $newId=$resp.success.registered_user.$n; break } }
+        }
+        $summary.Action = 'Create'
+        $summary.Status = 'Created'
+        $summary.HttpStatus = '200'
+        $summary.ResultId = "$newId"
+        Write-Host "Row $rowNum created (Id=$newId)."
+      }
+      catch {
+        $msg = $_.Exception.Message
+        $isDup = ($msg -match 'already in use' -or $msg -match '\b409\b')
+        if ($isDup) {
+          # find again (maybe by email if quickpin wasn’t unique filter)
+          $existingId2 = TryFind-RegisteredUserId -quickpin $r.quickpin -email $r.email
+          if ($existingId2) {
+            $null = Update-RegisteredUser -Id $existingId2 -r $r
+            $summary.Action = 'UpdateAfterCreateConflict'
+            $summary.Status = 'Updated'
+            $summary.HttpStatus = '200'
+            $summary.ResultId = "$existingId2"
+            Write-Host "Row $rowNum updated after create-conflict (Id=$existingId2)."
+          } else {
+            throw
+          }
+        } else {
+          throw
+        }
+      }
+    }
+
     $log.Add([pscustomobject]$summary)
-    Write-Host "Row $rowNum created: $($r.email) (Id=$id)."
-
     if ($ThrottleMs -gt 0) { Start-Sleep -Milliseconds $ThrottleMs }
   }
   catch {
