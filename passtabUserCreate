@@ -1,0 +1,158 @@
+#####################################################################
+#                                                                   #
+#                Created by James Hallifax 23.10.2025               #
+#                           Catalytic IT                            #
+#                                                                   #
+#                        Version 1.0.0                              #
+#####################################################################
+
+param(
+  [Parameter(Mandatory=$true)] [string] $BaseUrl,  # e.g. https://sbcl.passtab.com/v1/public
+  [Parameter(Mandatory=$true)] [string] $ApiKey,
+  [Parameter(Mandatory=$true)] [string] $CsvPath,
+  [switch] $DryRun,
+  [int] $ThrottleMs = 150,
+  [string] $LogPath = "$(Split-Path -Parent $CsvPath)\passtab_min_$(Get-Date -Format 'yyyyMMdd_HHmmss').csv"
+)
+
+# ---------- helpers ----------
+function Mask-Key([string]$k) {
+  if ([string]::IsNullOrEmpty($k) -or $k.Length -lt 6) { return '***' }
+  $k.Substring(0,3) + ('*' * ($k.Length-6)) + $k.Substring($k.Length-3)
+}
+
+function New-Headers([string]$k) {
+  @{
+    'PASSTAB-API-KEY' = $k
+  }
+}
+
+function Invoke-PasstabApi {
+  param(
+    [ValidateSet('GET','POST')] [string] $Method,
+    [string] $Path,
+    [hashtable] $Body
+  )
+
+  $headers = New-Headers $ApiKey
+  $uri = ($BaseUrl.TrimEnd('/')) + $Path
+  $attempt = 0; $max = 5; $rand = [Random]::new()
+
+  while ($true) {
+    $attempt++
+    try {
+      if ($Method -eq 'GET') {
+        return Invoke-RestMethod -Method GET -Uri $uri -Headers $headers -TimeoutSec 60
+      } else {
+        return Invoke-RestMethod -Method POST -Uri $uri -Headers $headers -Body $Body -TimeoutSec 60
+      }
+    } catch {
+      $status = $null
+      if ($_.Exception.Response -and $_.Exception.Response.StatusCode) {
+        $status = [int]$_.Exception.Response.StatusCode
+      }
+      $transient = $status -in 408,429,500,502,503,504
+      if ($attempt -lt $max -and $transient) {
+        $delay = [Math]::Min(6000, [Math]::Pow(2,$attempt)*200 + $rand.Next(0,200))
+        Start-Sleep -Milliseconds $delay
+        continue
+      }
+      throw "API $Method $Path failed (attempt $attempt, status=$status): $($_.Exception.Message)"
+    }
+  }
+}
+
+function New-PasstabUser {
+  param([hashtable]$r)
+
+  # Normalize type to title case
+  $type = ('' + $r.type).Trim().ToLower()
+  switch ($type) {
+    'staff'   { $type = 'Staff' }
+    'student' { $type = 'Student' }
+    'visitor' { $type = 'Visitor' }
+    default   { $type = $r.type }
+  }
+
+  # Default visitor subtype
+  $visitorType = if ($r.ContainsKey('visitorType') -and $r.visitorType) {
+    ('' + $r.visitorType).Trim()
+  } elseif ($type -eq 'Visitor') {
+    'Visitor'
+  } else {
+    'Visitor'
+  }
+
+  # Build REQUIRED form fields (form-url-encoded) Use these headers to build your CSV
+  $form = @{
+    quickpin               = ('' + $r.quickpin).Trim()
+    first_name             = ('' + $r.firstName).Trim()
+    last_name              = ('' + $r.lastName).Trim()
+    type                   = $type
+    customize_visitor_form = $visitorType
+    user_email             = ('' + $r.email).Trim()   # <-- was 'email'; now 'user_email'
+  }
+
+  Invoke-PasstabApi -Method POST -Path '/registered-users' -Body $form
+}
+
+# ---------- main ----------
+Write-Host "[Passtab] BaseUrl: $BaseUrl"
+Write-Host "[Passtab] API Key: $(Mask-Key $ApiKey)"
+Write-Host "[Passtab] CSV: $CsvPath  DryRun=$DryRun  Log: $LogPath"
+if (-not (Test-Path -LiteralPath $CsvPath)) { throw "CSV not found: $CsvPath" }
+
+$rows = Import-Csv -LiteralPath $CsvPath
+$log = New-Object System.Collections.Generic.List[object]
+$rowNum = 0
+
+foreach ($row in $rows) {
+  $rowNum++
+  $r = @{}
+  foreach ($p in $row.PSObject.Properties) { $r[$p.Name] = $p.Value }
+
+  $summary = [ordered]@{
+    Row        = $rowNum
+    QuickPin   = $r.quickpin
+    Email      = $r.email
+    Type       = $r.type
+    Status     = 'Pending'
+    HttpStatus = ''
+    ResultId   = ''
+    Error      = ''
+  }
+
+  try {
+    if ($DryRun) {
+      $summary.Status = 'OK-DRYRUN'
+      $log.Add([pscustomobject]$summary)
+      Write-Host "Row $rowNum [DRY-RUN] would create '$($r.email)' as $($r.type)."
+      continue
+    }
+
+    $resp = New-PasstabUser -r $r
+
+    $id = $null
+    foreach ($n in 'id','userId','_id') { if ($resp.PSObject.Properties.Name -contains $n) { $id = $resp.$n; break } }
+
+    $summary.Status     = 'Created'
+    $summary.HttpStatus = '200'
+    $summary.ResultId   = "$id"
+    $log.Add([pscustomobject]$summary)
+    Write-Host "Row $rowNum created: $($r.email) (Id=$id)."
+
+    if ($ThrottleMs -gt 0) { Start-Sleep -Milliseconds $ThrottleMs }
+  }
+  catch {
+    $status = ''
+    if ($_.Exception.Response -and $_.Exception.Response.StatusCode) { $status = [int]$_.Exception.Response.StatusCode }
+    $summary.Status     = 'Error'
+    $summary.HttpStatus = "$status"
+    $summary.Error      = $_.Exception.Message
+    $log.Add([pscustomobject]$summary)
+    Write-Error "Row $rowNum error: $($summary.Error)"
+  }
+}
+
+$log | Export-Csv -NoTypeInformation -LiteralPath $LogPath
+Write-Host "Done. Results: $LogPath"
